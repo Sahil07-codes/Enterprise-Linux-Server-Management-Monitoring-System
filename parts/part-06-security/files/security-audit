@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    printf 'Usage: security-audit [--help]\nRead-only summary of listeners, firewalld, SELinux, and failed units.\n'
+}
+
+if (($# > 0)); then
+    if (($# == 1)) && [[ $1 == --help ]]; then usage; exit 0; fi
+    usage >&2
+    exit 2
+fi
+
+missing=()
+for command_name in date ss systemctl getenforce firewall-cmd; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then missing+=("$command_name"); fi
+done
+if ((${#missing[@]} > 0)); then
+    printf 'Missing required commands: %s\n' "${missing[*]}" >&2
+    exit 3
+fi
+
+audit_failures=0
+printf 'ELSM security audit (read-only): %s\n' "$(date --iso-8601=seconds)"
+printf '\n== Listening sockets ==\n'
+ss -tulpn
+printf '\n== firewalld ==\n'
+if ! firewall-cmd --state; then
+    printf 'ERROR: firewalld state query failed; inspect service state and journal.\n' >&2
+    audit_failures=$((audit_failures + 1))
+fi
+if ! firewall-cmd --get-active-zones; then
+    printf 'ERROR: active-zone query failed.\n' >&2
+    audit_failures=$((audit_failures + 1))
+fi
+if ! firewall-cmd --list-all; then
+    printf 'ERROR: firewall rule query failed.\n' >&2
+    audit_failures=$((audit_failures + 1))
+fi
+printf '\n== SELinux ==\n'
+getenforce
+if command -v sestatus >/dev/null 2>&1; then sestatus; else printf 'sestatus unavailable.\n'; fi
+printf '\n== Failed units ==\n'
+systemctl --failed --no-pager
+printf '\nThis report does not apply or recommend automatic changes.\n'
+if ((audit_failures > 0)); then exit 1; fi

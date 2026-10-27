@@ -1,0 +1,6 @@
+# Plain KEY=value data only. Do not put shell expressions or quotes here.
+BACKUP_SOURCE=/srv/company
+BACKUP_DEST=/var/backups/elsm
+RETENTION_DAYS=7
+LOG_FILE=/var/log/elsm/backup.log
+

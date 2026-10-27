@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly DEFAULT_CONFIG=/etc/elsm/backup.conf
+readonly LOCK_FILE=/run/lock/elsm-backup.lock
+CONFIG_FILE=$DEFAULT_CONFIG
+BACKUP_SOURCE=/srv/company
+BACKUP_DEST=/var/backups/elsm
+RETENTION_DAYS=7
+LOG_FILE=/var/log/elsm/backup.log
+temporary_archive=
+temporary_list=
+temporary_checksum=
+dry_run=false
+
+usage() {
+    cat <<'USAGE'
+Usage: elsm-backup [--config FILE] [--dry-run] [--help]
+
+Create and checksum a timestamped archive of the mounted /srv/company data.
+Retention is restricted to regular ELSM archives under /var/backups/elsm.
+Restore archives to a temporary directory; this command never restores live data.
+--dry-run lists eligible retention candidates without creating or deleting files.
+Exit codes: 0 success; 1 operation failed; 2 invalid usage/config; 3 missing dependency.
+USAGE
+}
+
+while (($# > 0)); do
+    case $1 in
+        --help) usage; exit 0 ;;
+        --config)
+            if (($# < 2)); then usage >&2; exit 2; fi
+            CONFIG_FILE=$2
+            shift 2
+            ;;
+        --dry-run) dry_run=true; shift ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+if [[ ! -r $CONFIG_FILE ]]; then
+    printf 'Configuration is not readable: %s\n' "$CONFIG_FILE" >&2
+    exit 2
+fi
+
+declare -A seen_keys=()
+while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ ! $line =~ ^([A-Z0-9_]+)=([^[:space:]]+)$ ]]; then
+        printf 'Invalid config line; expected KEY=value without whitespace: %s\n' "$line" >&2
+        exit 2
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    if [[ -n ${seen_keys[$key]:-} ]]; then printf 'Duplicate config key: %s\n' "$key" >&2; exit 2; fi
+    seen_keys[$key]=1
+    case $key in
+        BACKUP_SOURCE) BACKUP_SOURCE=$value ;;
+        BACKUP_DEST) BACKUP_DEST=$value ;;
+        RETENTION_DAYS) RETENTION_DAYS=$value ;;
+        LOG_FILE) LOG_FILE=$value ;;
+        *) printf 'Unknown config key: %s\n' "$key" >&2; exit 2 ;;
+    esac
+done <"$CONFIG_FILE"
+
+if [[ $BACKUP_SOURCE != /srv/company || $BACKUP_DEST != /var/backups/elsm || $LOG_FILE != /var/log/elsm/backup.log ]]; then
+    printf 'Source, destination, and log must match canonical project paths.\n' >&2
+    exit 2
+fi
+if [[ ! $RETENTION_DAYS =~ ^[1-9][0-9]{0,3}$ ]] || ((RETENTION_DAYS > 3650)); then
+    printf 'RETENTION_DAYS must be an integer from 1 through 3650.\n' >&2
+    exit 2
+fi
+if ((EUID != 0)); then printf 'Run this script as root.\n' >&2; exit 1; fi
+for command_name in date tar sha256sum flock find stat install mktemp mv rm tee basename mountpoint readlink chown chmod findmnt; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$command_name" >&2
+        exit 3
+    fi
+done
+if ! mountpoint -q "$BACKUP_SOURCE"; then
+    printf '%s is not a mount point; refusing to back up the root filesystem copy.\n' "$BACKUP_SOURCE" >&2
+    exit 1
+fi
+mount_info=$(findmnt --noheadings --raw --output SOURCE,FSTYPE --mountpoint "$BACKUP_SOURCE")
+read -r mount_source mount_type <<<"$mount_info"
+if [[ $mount_type != xfs || $mount_source != /dev/mapper/vg_elsm-lv_company && $mount_source != /dev/vg_elsm/lv_company ]]; then
+    printf 'Unexpected backup source mount: source=%s filesystem=%s; expected vg_elsm/lv_company on XFS.\n' \
+        "${mount_source:-unknown}" "${mount_type:-unknown}" >&2
+    exit 1
+fi
+if [[ -L /var/backups || -L $BACKUP_DEST ]]; then
+    printf 'Backup destination must not be a symbolic link.\n' >&2
+    exit 1
+fi
+if [[ $(readlink -f -- "$BACKUP_DEST") != /var/backups/elsm ]]; then
+    printf 'Resolved backup destination is not canonical; refusing retention operations.\n' >&2
+    exit 1
+fi
+if [[ -L /var/log/elsm || -L $LOG_FILE ]]; then
+    printf 'Backup log path must not be a symbolic link.\n' >&2
+    exit 1
+fi
+if [[ -e $LOG_FILE && ! -f $LOG_FILE ]]; then
+    printf 'Backup log path exists but is not a regular file.\n' >&2
+    exit 1
+fi
+if [[ $BACKUP_DEST == "$BACKUP_SOURCE" || $BACKUP_DEST == "$BACKUP_SOURCE/"* ]]; then
+    printf 'Backup destination must not be inside the backup source.\n' >&2
+    exit 2
+fi
+if [[ $dry_run == true ]]; then
+    if [[ -e $BACKUP_DEST && ! -d $BACKUP_DEST ]]; then
+        printf 'Backup destination exists but is not a directory.\n' >&2
+        exit 1
+    fi
+    if [[ ! -d $BACKUP_DEST ]]; then
+        printf 'Dry run: backup destination does not exist; no retention candidates.\n'
+        exit 0
+    fi
+    printf 'Dry run: files older than %s day(s) eligible for retention:\n' "$RETENTION_DAYS"
+    find "$BACKUP_DEST" -mindepth 1 -maxdepth 1 -type f -name 'elsm-*.tar.gz' \
+        -mmin "+$((RETENTION_DAYS * 1440))" -print
+    exit 0
+fi
+install -d -o root -g root -m 0700 "$BACKUP_DEST"
+install -d -o root -g root -m 0750 /var/log/elsm /run/lock
+if [[ ! -e $LOG_FILE ]]; then install -o root -g root -m 0640 /dev/null "$LOG_FILE"; fi
+chown root:root "$LOG_FILE"
+chmod 0640 "$LOG_FILE"
+
+log() {
+    local level=$1
+    shift
+    printf '%s [%s] %s\n' "$(date --iso-8601=seconds)" "$level" "$*" | tee -a "$LOG_FILE"
+}
+on_error() {
+    local status=$?
+    trap - ERR
+    printf 'Backup failed with exit status %s.\n' "$status" >&2
+    if [[ -d /var/log/elsm && -w /var/log/elsm ]]; then
+        printf '%s [ERROR] Backup failed (exit=%s).\n' "$(date --iso-8601=seconds)" "$status" >>"$LOG_FILE" || true
+    fi
+    exit "$status"
+}
+cleanup() {
+    [[ -z $temporary_archive ]] || rm -f -- "$temporary_archive"
+    [[ -z $temporary_list ]] || rm -f -- "$temporary_list"
+    [[ -z $temporary_checksum ]] || rm -f -- "$temporary_checksum"
+}
+trap cleanup EXIT
+trap on_error ERR
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then log ERROR 'Another backup is already running.'; exit 1; fi
+started=$(date +%s)
+timestamp=$(date +%Y%m%dT%H%M%S%z)
+archive="$BACKUP_DEST/elsm-${timestamp}.tar.gz"
+checksum="$archive.sha256"
+if [[ -e $archive || -e $checksum ]]; then
+    log ERROR "Archive name already exists; refusing to overwrite: $archive"
+    exit 1
+fi
+temporary_archive=$(mktemp "$BACKUP_DEST/.elsm-archive.XXXXXX")
+log INFO "Backup started for $BACKUP_SOURCE."
+tar --create --gzip --numeric-owner --acls --xattrs --file "$temporary_archive" \
+    --directory /srv company
+mv -- "$temporary_archive" "$archive"
+temporary_archive=
+temporary_checksum="$checksum.tmp.$$"
+(
+    cd "$BACKUP_DEST"
+    sha256sum "$(basename "$archive")" >"$temporary_checksum"
+)
+mv -- "$temporary_checksum" "$checksum"
+temporary_checksum=
+archive_size=$(stat -c '%s' "$archive")
+log INFO "Archive created: $archive (bytes=$archive_size)."
+
+temporary_list=$(mktemp /run/lock/elsm-backup-retention.XXXXXX)
+find "$BACKUP_DEST" -mindepth 1 -maxdepth 1 -type f -name 'elsm-*.tar.gz' \
+    -mmin "+$((RETENTION_DAYS * 1440))" -print0 >"$temporary_list"
+while IFS= read -r -d '' expired_archive; do
+    if [[ $expired_archive != "$BACKUP_DEST"/elsm-*.tar.gz || -L $expired_archive ]]; then
+        log ERROR "Retention candidate failed path/type validation: $expired_archive"
+        exit 1
+    fi
+    expired_checksum="$expired_archive.sha256"
+    if [[ -e $expired_checksum && -L $expired_checksum ]]; then
+        log ERROR "Refusing to remove a symbolic-link checksum: $expired_checksum"
+        exit 1
+    fi
+    rm -f -- "$expired_archive"
+    [[ ! -e $expired_checksum ]] || rm -f -- "$expired_checksum"
+    log INFO "Expired archive removed: $expired_archive"
+done <"$temporary_list"
+
+duration=$(( $(date +%s) - started ))
+log INFO "Backup completed successfully (duration_seconds=$duration)."

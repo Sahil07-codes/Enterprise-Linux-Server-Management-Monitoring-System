@@ -1,0 +1,2 @@
+/srv/company 192.168.56.0/24(rw,sync,root_squash,no_subtree_check)
+

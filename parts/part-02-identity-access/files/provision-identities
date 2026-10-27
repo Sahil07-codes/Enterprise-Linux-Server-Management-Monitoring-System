@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly COMPANY_ROOT=/srv/company
+readonly SUDOERS_FILE=/etc/sudoers.d/elsm-labadmin
+
+usage() {
+    cat <<'USAGE'
+Usage: provision-identities [--dry-run] [--help]
+
+Create the ELSM local groups/users, a validated labadmin sudoers drop-in,
+and company directory permissions. Run as root after /srv/company is mounted.
+No passwords are set. --dry-run validates prerequisites and prints intended actions.
+Exit codes: 0 success; 1 operation failed; 2 invalid usage; 3 dependency missing.
+USAGE
+}
+
+dry_run=false
+while (($# > 0)); do
+    case $1 in
+        --help) usage; exit 0 ;;
+        --dry-run) dry_run=true; shift ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+if ((EUID != 0)); then
+    printf 'Run this script as root.\n' >&2
+    exit 1
+fi
+for command_name in date getent groupadd useradd usermod id mountpoint install visudo setfacl chmod readlink mktemp; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$command_name" >&2
+        exit 3
+    fi
+done
+if ! mountpoint -q "$COMPANY_ROOT"; then
+    printf '%s is not a mount point; refusing to create company directories.\n' "$COMPANY_ROOT" >&2
+    exit 1
+fi
+if [[ -L $COMPANY_ROOT || $(readlink -f -- "$COMPANY_ROOT") != "$COMPANY_ROOT" ]]; then
+    printf '%s must be a real canonical mount point, not a symbolic link.\n' "$COMPANY_ROOT" >&2
+    exit 1
+fi
+
+for directory in development hr operations projects; do
+    path="$COMPANY_ROOT/$directory"
+    if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
+        printf 'Company path is not a normal directory: %s\n' "$path" >&2
+        exit 1
+    fi
+done
+
+validate_existing_user() {
+    local user_name=$1 primary_group=$2
+    if getent passwd "$user_name" >/dev/null; then
+        if [[ $(id -gn "$user_name") != "$primary_group" ]]; then
+            printf 'Existing user %s has a different primary group; refusing to alter it.\n' "$user_name" >&2
+            return 1
+        fi
+    fi
+}
+validate_existing_user labadmin linuxadmins
+validate_existing_user dev01 developers
+validate_existing_user dev02 developers
+validate_existing_user hr01 hrteam
+validate_existing_user ops01 ops
+validate_existing_user auditor01 projectreaders
+
+if [[ -L $SUDOERS_FILE || ( -e $SUDOERS_FILE && ! -f $SUDOERS_FILE ) ]]; then
+    printf '%s is not a regular sudoers file; refusing to use it.\n' "$SUDOERS_FILE" >&2
+    exit 1
+fi
+if [[ -e $SUDOERS_FILE ]] && [[ $(<"$SUDOERS_FILE") != 'labadmin ALL=(ALL) ALL' ]]; then
+    printf '%s already exists with different content; refusing to overwrite.\n' "$SUDOERS_FILE" >&2
+    exit 1
+fi
+
+if [[ $dry_run == true ]]; then
+    printf '%s [INFO] Dry run; no system changes will be made.\n' "$(date --iso-8601=seconds)"
+    printf 'Would ensure groups: linuxadmins developers hrteam ops projectreaders\n'
+    printf 'Would ensure users: labadmin dev01 dev02 hr01 ops01 auditor01 (no passwords)\n'
+    printf 'Would validate/create sudo rule: %s\n' "$SUDOERS_FILE"
+    printf 'Would configure mounted company directories and ACLs under %s\n' "$COMPANY_ROOT"
+    exit 0
+fi
+
+ensure_group() {
+    local group_name=$1
+    if ! getent group "$group_name" >/dev/null; then
+        groupadd "$group_name"
+    fi
+}
+
+ensure_user() {
+    local user_name=$1
+    local primary_group=$2
+    local supplementary_groups=$3
+    if ! getent passwd "$user_name" >/dev/null; then
+        useradd --create-home --shell /bin/bash --gid "$primary_group" "$user_name"
+    else
+        if [[ $(id -gn "$user_name") != "$primary_group" ]]; then
+            printf 'Existing user %s has a different primary group; refusing to alter it.\n' "$user_name" >&2
+            return 1
+        fi
+    fi
+    if [[ -n $supplementary_groups ]]; then
+        usermod --append --groups "$supplementary_groups" "$user_name"
+    fi
+}
+
+for group_name in linuxadmins developers hrteam ops projectreaders; do
+    ensure_group "$group_name"
+done
+ensure_user labadmin linuxadmins ''
+ensure_user dev01 developers projectreaders
+ensure_user dev02 developers projectreaders
+ensure_user hr01 hrteam ''
+ensure_user ops01 ops projectreaders
+ensure_user auditor01 projectreaders ''
+
+if [[ ! -e $SUDOERS_FILE ]]; then
+    sudoers_tmp=$(mktemp /etc/sudoers.d/.elsm-labadmin.XXXXXX)
+    trap 'rm -f -- "$sudoers_tmp"' EXIT
+    printf '%s\n' 'labadmin ALL=(ALL) ALL' >"$sudoers_tmp"
+    chmod 0440 "$sudoers_tmp"
+    visudo --check --file "$sudoers_tmp"
+    install -o root -g root -m 0440 "$sudoers_tmp" "$SUDOERS_FILE"
+    rm -f -- "$sudoers_tmp"
+    trap - EXIT
+fi
+visudo --check --file "$SUDOERS_FILE"
+
+install -d -o root -g root -m 0755 "$COMPANY_ROOT"
+install -d -o root -g developers -m 2770 "$COMPANY_ROOT/development"
+install -d -o root -g hrteam -m 2770 "$COMPANY_ROOT/hr"
+install -d -o root -g ops -m 2770 "$COMPANY_ROOT/operations"
+install -d -o root -g projectreaders -m 2750 "$COMPANY_ROOT/projects"
+
+setfacl -m g:projectreaders:rx,d:g:projectreaders:rx "$COMPANY_ROOT/development"
+setfacl -m g:projectreaders:rx,d:g:projectreaders:rx "$COMPANY_ROOT/operations"
+setfacl -m g:developers:rx,g:ops:rx,d:g:developers:rx,d:g:ops:rx "$COMPANY_ROOT/projects"
+
+printf '%s [INFO] Identity and access provisioning complete. Set passwords interactively and run the access tests.\n' "$(date --iso-8601=seconds)"

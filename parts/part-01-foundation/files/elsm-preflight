@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: elsm-preflight [--help]
+
+Read-only RHEL host discovery for the ELSM lab. No system configuration is changed.
+Exit codes: 0 report complete; 2 invalid usage; 3 required command missing.
+USAGE
+}
+
+if (($# > 0)); then
+    if (($# == 1)) && [[ $1 == --help ]]; then
+        usage
+        exit 0
+    fi
+    usage >&2
+    exit 2
+fi
+
+missing=()
+command_failures=0
+for command_name in date cat uname hostnamectl ip nmcli lsblk df getenforce systemctl dnf; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        missing+=("$command_name")
+    fi
+done
+
+run_section() {
+    local title=$1
+    shift
+    printf '\n## %s\n' "$title"
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'UNAVAILABLE: command not found: %s\n' "$1"
+        return 0
+    fi
+    if ! "$@"; then
+        printf 'ERROR: command failed: %s\n' "$*" >&2
+        command_failures=$((command_failures + 1))
+    fi
+}
+
+printf 'ELSM read-only preflight: %s\n' "$(date --iso-8601=seconds)"
+if [[ -r /etc/redhat-release ]]; then
+    printf '\n## Distribution\n'
+    cat /etc/redhat-release
+else
+    printf '\n## Distribution\nUNAVAILABLE: /etc/redhat-release is not readable\n'
+fi
+run_section 'Kernel' uname -r
+run_section 'Hostname' hostnamectl
+run_section 'Addresses' ip -br address
+run_section 'Routes' ip route
+run_section 'NetworkManager connections' nmcli connection show
+run_section 'Block devices' lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+run_section 'Filesystems' df -hT
+run_section 'SELinux mode' getenforce
+run_section 'Failed systemd units' systemctl --failed --no-pager
+run_section 'DNF repositories (read-only)' dnf repolist --enabled
+
+if ((${#missing[@]} > 0)); then
+    printf '\nMissing required commands: %s\n' "${missing[*]}" >&2
+    exit 3
+fi
+if ((command_failures > 0)); then
+    printf '\nPreflight completed with %s failed command(s).\n' "$command_failures" >&2
+    exit 1
+fi
+exit 0

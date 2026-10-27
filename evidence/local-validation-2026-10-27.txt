@@ -1,0 +1,33 @@
+ELSM local validation record
+Date: 2026-10-27
+Environment: Ubuntu 26.04.1 LTS under WSL 2, run as root; not a RHEL target
+Python: 3.14.4
+ShellCheck: 0.11.0
+Ansible Core: 2.20.1
+
+Central safe suite
+Command:
+  python3 bin/elsm all --profile test \
+    --report-dir /tmp/elsm-final-test-reports \
+    --log-file /tmp/elsm-final-test-logs/automation.log
+Result: PASS; exit 0; 15 recorded checks, 10 PASS and 5 target-only acceptance items NOT RUN; no FAIL or BLOCKED checks.
+Observed:
+  - Static script passed Bash syntax checks for 16 shell scripts, ShellCheck, and Ansible syntax validation of the optional playbook.
+  - All six Bash component test scripts passed.
+  - The Python automation CLI suite passed 16 tests covering argument parsing, exit/status mapping, command capture, test discovery/failure aggregation, optional dependencies, safe output paths, report JSON/modes, and plan/deploy no-command behavior.
+  - Optional ShellCheck and Ansible syntax checks both ran and passed.
+  - Five RHEL/remote acceptance items were explicitly NOT RUN.
+
+Component behaviors exercised
+  - Invalid backup and health configurations were rejected.
+  - Disk thresholds returned OK at 79%, WARN at 80% and 89%, and CRITICAL at 90%.
+  - Identity dry-run accepted mocked prerequisites and rejected a conflicting mocked primary group.
+  - Storage validation accepted a mocked LVM/XFS mount and rejected non-XFS and unmounted cases.
+  - Health checking reported an unmounted path and inactive Apache as CRITICAL and returned non-zero.
+  - Backup created a temporary-fixture archive, passed SHA-256 verification, restored identical data, removed expired synthetic archives/checksums, and surfaced simulated tar failure while cleaning its temporary archive.
+  - CLI `plan` returned 0 while marking all actions REVIEW REQUIRED. CLI `deploy --profile lab` returned 3 with deployment BLOCKED and did not invoke host commands.
+  - CLI `validate` returned 3 with both target integration checks BLOCKED because `/etc/redhat-release` is absent on Ubuntu; no RHEL integration command ran.
+  - The generated JSON report parsed successfully with `python3 -m json.tool`; report and log permissions were both verified as `0600`.
+
+Target acceptance remains NOT RUN
+No RHEL 9.6 deployment, reboot/persistence check, actual LVM/XFS filesystem test, firewall/SELinux remote exposure acceptance, scheduled on-target backup, restore on the actual filesystem, or second-VM NFS/client test was performed. Ansible idempotency on a real target was also NOT RUN. This record is local component/static evidence only and must not be used to claim end-to-end RHEL acceptance.

@@ -1,0 +1,6 @@
+[elsm_servers]
+rhel-srv01 ansible_host=192.168.56.10 ansible_user=labadmin
+
+[elsm_servers:vars]
+ansible_become=true
+

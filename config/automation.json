@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "paths": {
+    "company_mount": "/srv/company",
+    "backup_config": "/etc/elsm/backup.conf",
+    "health_config": "/etc/elsm/healthcheck.conf",
+    "backup_destination": "/var/backups/elsm",
+    "backup_service": "elsm-backup.service",
+    "backup_timer": "elsm-backup.timer",
+    "health_report": "/var/lib/elsm/health/latest.txt",
+    "reports": "/var/lib/elsm/reports",
+    "automation_log": "/var/log/elsm/automation.log"
+  },
+  "repository_files": {
+    "host_preflight": "parts/part-01-foundation/files/elsm-preflight",
+    "static_check": "tests/static/check-shell.sh",
+    "unit_directory": "tests/unit",
+    "status_check": "tests/integration/elsm-status",
+    "smoke_check": "tests/integration/elsm-smoke-check",
+    "ansible_playbook": "parts/part-10-ansible-extension/playbooks/site.yml",
+    "ansible_inventory": "parts/part-10-ansible-extension/inventory/hosts.example"
+  },
+  "deployment_steps": [
+    {
+      "name": "Foundation and host preflight",
+      "owner": "Part 01",
+      "mode": "read-only",
+      "prerequisite": "RHEL 9 target and reviewed host/network baseline",
+      "verification": "parts/part-01-foundation/files/elsm-preflight"
+    },
+    {
+      "name": "Dedicated LVM/XFS storage",
+      "owner": "Part 03",
+      "mode": "manual-destructive",
+      "prerequisite": "Operator positively identifies a dedicated disk and confirms the exact device",
+      "verification": "parts/part-03-storage/files/validate-storage"
+    },
+    {
+      "name": "Identity, groups, ACLs, and sudoers",
+      "owner": "Part 02",
+      "mode": "operator-reviewed",
+      "prerequisite": "Verified /srv/company mount and reviewed existing local accounts",
+      "verification": "parts/part-02-identity-access/files/provision-identities"
+    },
+    {
+      "name": "Apache static portal",
+      "owner": "Part 05",
+      "mode": "operator-reviewed",
+      "prerequisite": "Package availability, existing Apache ownership, and reviewed SELinux labels",
+      "verification": "Local HTTP response and approved remote client test"
+    },
+    {
+      "name": "Optional NFS server/export",
+      "owner": "Part 04",
+      "mode": "optional-manual",
+      "prerequisite": "Approved private subnet, client VM, and reviewed exports/firewall/SELinux",
+      "verification": "exportfs output and second-VM client mount/access test"
+    },
+    {
+      "name": "Firewall and SELinux policy",
+      "owner": "Part 06",
+      "mode": "security-reviewed",
+      "prerequisite": "Console access, active zone/interface, approved source CIDRs, and rollback plan",
+      "verification": "Active zones, all zone rules, listening sockets, labels, and remote tests"
+    },
+    {
+      "name": "Scheduled backup and restore",
+      "owner": "Part 07",
+      "mode": "operator-reviewed",
+      "prerequisite": "Verified source mount, destination capacity, and reviewed retention",
+      "verification": "Timer state, archive checksum, and restore to a fresh temporary directory"
+    },
+    {
+      "name": "Health monitoring",
+      "owner": "Part 08",
+      "mode": "operator-reviewed",
+      "prerequisite": "Reviewed thresholds and report/log ownership",
+      "verification": "Health report compared with live measurements"
+    },
+    {
+      "name": "Integration and reboot acceptance",
+      "owner": "Part 09",
+      "mode": "manual-acceptance",
+      "prerequisite": "All enabled components installed and disposable VM snapshot available",
+      "verification": "Acceptance checklist, reboot persistence, network tests, and restore evidence"
+    },
+    {
+      "name": "Optional Ansible identity example",
+      "owner": "Part 10",
+      "mode": "optional-example",
+      "prerequisite": "Private inventory, Ansible controller, and disposable RHEL target",
+      "verification": "Syntax check, check mode, apply, and idempotency check mode"
+    }
+  ],
+  "target_acceptance_not_run": [
+    "RHEL 9 deployment and reboot persistence",
+    "Remote HTTP/firewall source-scope acceptance",
+    "Second-VM NFS connectivity",
+    "Backup/restore on the actual LVM/XFS filesystem",
+    "RHEL Ansible idempotency"
+  ]
+}

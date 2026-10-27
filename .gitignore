@@ -1,0 +1,53 @@
+# Secrets and local configuration
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+
+# Backups, VM artifacts, and local logs
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.zst
+*.tgz
+*.xz
+*.zip
+*.7z
+*.qcow2
+*.vmdk
+*.vdi
+*.vmx
+*.vbox
+*.vbox-prev
+*.vmsd
+*.vmsn
+*.ova
+*.ovf
+*.bak
+*.backup
+*.log
+!*.log.example
+id_rsa
+id_ed25519
+.ssh/
+
+# Generated reports/evidence are reviewed before being added
+evidence/generated/
+reports/generated/
+docs/evidence/captures/
+parts/**/evidence/generated/
+
+# Python runtime/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.swp
+*~

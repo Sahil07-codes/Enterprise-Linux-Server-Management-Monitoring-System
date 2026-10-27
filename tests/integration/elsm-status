@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+failures=0
+reviews=0
+
+usage() {
+    printf 'Usage: elsm-status [--help]\nRead-only deployment verification; no configuration is changed.\n'
+}
+
+if (($# > 0)); then
+    if (($# == 1)) && [[ $1 == --help ]]; then usage; exit 0; fi
+    usage >&2
+    exit 2
+fi
+
+check() {
+    local name=$1
+    shift
+    if "$@"; then
+        printf 'PASS | %s\n' "$name"
+    else
+        printf 'FAIL | %s\n' "$name"
+        failures=$((failures + 1))
+    fi
+}
+
+review() {
+    printf 'REVIEW | %s\n' "$1"
+    reviews=$((reviews + 1))
+}
+
+verify_checksum() {
+    local archive=$1
+    (cd -- "$(dirname -- "$archive")" && sha256sum --check "$(basename -- "$archive").sha256")
+}
+
+verify_health_report() {
+    local report=$1
+    grep -q '^Generated:' "$report" &&
+        grep -Eq '^Overall: (OK|WARN|CRITICAL)$' "$report"
+}
+
+printf 'ELSM deployment status (read-only): %s\n' "$(date --iso-8601=seconds)"
+
+if [[ -r /etc/redhat-release ]]; then
+    release=$(</etc/redhat-release)
+    if [[ $release == *'Red Hat Enterprise Linux'* ]]; then
+        printf 'PASS | target OS | %s\n' "$release"
+    else
+        printf 'FAIL | target OS | expected RHEL; observed %s\n' "$release"
+        failures=$((failures + 1))
+    fi
+else
+    printf 'FAIL | target OS | /etc/redhat-release is unavailable\n'
+    failures=$((failures + 1))
+fi
+
+check 'storage LVM/XFS/mount validation' bash "$root/parts/part-03-storage/files/validate-storage"
+
+for group_name in linuxadmins developers hrteam ops projectreaders; do
+    check "identity group $group_name" getent group "$group_name"
+done
+for user_name in labadmin dev01 dev02 hr01 ops01 auditor01; do
+    check "identity user $user_name" getent passwd "$user_name"
+done
+check 'identity sudoers syntax' visudo --check --file /etc/sudoers.d/elsm-labadmin
+if command -v getfacl >/dev/null 2>&1; then
+    check 'company directory ACLs readable' getfacl --absolute-names \
+        /srv/company/development /srv/company/hr /srv/company/operations /srv/company/projects
+else
+    printf 'FAIL | required command getfacl missing\n'
+    failures=$((failures + 1))
+fi
+
+check 'Apache enabled' systemctl is-enabled --quiet httpd
+check 'Apache active' systemctl is-active --quiet httpd
+if command -v curl >/dev/null 2>&1; then
+    check 'local Apache response' curl --fail --silent --show-error http://localhost/
+else
+    printf 'FAIL | required command curl missing\n'
+    failures=$((failures + 1))
+fi
+if command -v matchpathcon >/dev/null 2>&1; then
+    check 'Apache content SELinux context' matchpathcon -V /var/www/html/index.html
+else
+    review 'matchpathcon is unavailable; Apache SELinux file labeling was not verified'
+fi
+
+check 'backup timer enabled' systemctl is-enabled --quiet elsm-backup.timer
+check 'backup timer active' systemctl is-active --quiet elsm-backup.timer
+if [[ -d /var/backups/elsm && ! -L /var/backups/elsm ]]; then
+    newest_archive=$(find /var/backups/elsm -maxdepth 1 -type f -name 'elsm-*.tar.gz' \
+        -printf '%T@ %p\n' | sort -nr | head -n 1)
+    if [[ -n $newest_archive ]]; then
+        archive_path=${newest_archive#* }
+        check 'newest backup checksum' verify_checksum "$archive_path"
+    else
+        printf 'FAIL | no ELSM backup archive found\n'
+        failures=$((failures + 1))
+    fi
+else
+    printf 'FAIL | backup destination missing or is a symbolic link\n'
+    failures=$((failures + 1))
+fi
+
+if [[ -f /var/lib/elsm/health/latest.txt && ! -L /var/lib/elsm/health/latest.txt ]]; then
+    check 'health report permissions' test "$(stat -c %a /var/lib/elsm/health/latest.txt)" = 600
+    check 'health report timestamp and overall status' verify_health_report /var/lib/elsm/health/latest.txt
+else
+    printf 'FAIL | health report missing or is a symbolic link\n'
+    failures=$((failures + 1))
+fi
+
+check 'SELinux enforcing' test "$(getenforce)" = Enforcing
+check 'firewalld running' firewall-cmd --state
+if firewall-cmd --get-active-zones; then
+    printf 'INFO | active firewalld zones listed above; compare against the approved lab network plan\n'
+else
+    failures=$((failures + 1))
+    printf 'FAIL | could not read active firewalld zones\n'
+fi
+if firewall-cmd --list-all-zones; then
+    printf 'INFO | all firewall zone rules listed above for scope review\n'
+else
+    failures=$((failures + 1))
+    printf 'FAIL | could not read current firewall rules\n'
+fi
+if command -v ss >/dev/null 2>&1; then
+    ss -tulpn
+    printf 'INFO | listening sockets listed above for exposure review\n'
+else
+    review 'ss is unavailable; listening sockets were not inspected'
+fi
+if command -v matchpathcon >/dev/null 2>&1; then
+    check 'company mount SELinux context' matchpathcon -V /srv/company
+else
+    review 'matchpathcon is unavailable; company mount SELinux labeling was not verified'
+fi
+
+if systemctl is-enabled --quiet nfs-server; then
+    check 'NFS service active' systemctl is-active --quiet nfs-server
+    if command -v exportfs >/dev/null 2>&1; then
+        check 'NFS exports readable' exportfs --verbose
+    else
+        printf 'FAIL | NFS is enabled but exportfs is unavailable\n'
+        failures=$((failures + 1))
+    fi
+else
+    printf 'SKIP | optional NFS service is not enabled\n'
+fi
+
+review 'confirm firewall source CIDRs and remote client reachability against the approved network plan'
+review 'confirm a second-VM NFS test, reboot persistence, and end-to-end restore using the acceptance checklist'
+
+printf 'Summary | failures=%s reviews=%s\n' "$failures" "$reviews"
+if ((failures > 0)); then exit 1; fi
+if ((reviews > 0)); then exit 2; fi
+printf 'All automated read-only checks passed.\n'

@@ -1,0 +1,17 @@
+[Unit]
+Description=Create an ELSM company-data backup
+After=local-fs.target
+RequiresMountsFor=/srv/company
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/elsm-backup
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/company
+ReadWritePaths=/var/backups/elsm /var/log/elsm /run/lock

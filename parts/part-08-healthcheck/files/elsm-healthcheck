@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CONFIG_FILE=/etc/elsm/healthcheck.conf
+readonly REPORT_FILE=/var/lib/elsm/health/latest.txt
+readonly LOG_FILE=/var/log/elsm/healthcheck.log
+DISK_WARN_PERCENT=80
+DISK_CRITICAL_PERCENT=90
+MEMORY_WARN_AVAILABLE_PERCENT=15
+MEMORY_CRITICAL_AVAILABLE_PERCENT=5
+LOAD_WARN_1M=2.00
+LOAD_CRITICAL_1M=4.00
+BACKUP_MAX_AGE_HOURS=36
+NFS_ENABLED=false
+declare -a RESULTS=()
+critical_count=0
+warning_count=0
+overall=OK
+
+usage() {
+    printf 'Usage: elsm-healthcheck [--config FILE] [--self-test-thresholds] [--help]\nRead-only ELSM health checks; writes latest report and append-only log.\nThreshold self-test validates disk boundaries without writing host state.\nExit codes: 0 no critical findings/test passed; 1 critical finding/test failed; 2 invalid config/usage; 3 dependency missing.\n'
+}
+
+self_test_thresholds=false
+while (($# > 0)); do
+    case $1 in
+        --help) usage; exit 0 ;;
+        --config)
+            if (($# < 2)); then usage >&2; exit 2; fi
+            CONFIG_FILE=$2
+            shift 2
+            ;;
+        --self-test-thresholds)
+            self_test_thresholds=true
+            shift
+            ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+if ! command -v awk >/dev/null 2>&1; then printf 'Required command not found: awk\n' >&2; exit 3; fi
+if [[ ! -r $CONFIG_FILE ]]; then printf 'Configuration is not readable: %s\n' "$CONFIG_FILE" >&2; exit 2; fi
+
+declare -A seen_keys=()
+while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ ! $line =~ ^([A-Z0-9_]+)=([^[:space:]]+)$ ]]; then
+        printf 'Invalid config line; expected KEY=value: %s\n' "$line" >&2
+        exit 2
+    fi
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    if [[ -n ${seen_keys[$key]:-} ]]; then printf 'Duplicate config key: %s\n' "$key" >&2; exit 2; fi
+    seen_keys[$key]=1
+    case $key in
+        DISK_WARN_PERCENT) DISK_WARN_PERCENT=$value ;;
+        DISK_CRITICAL_PERCENT) DISK_CRITICAL_PERCENT=$value ;;
+        MEMORY_WARN_AVAILABLE_PERCENT) MEMORY_WARN_AVAILABLE_PERCENT=$value ;;
+        MEMORY_CRITICAL_AVAILABLE_PERCENT) MEMORY_CRITICAL_AVAILABLE_PERCENT=$value ;;
+        LOAD_WARN_1M) LOAD_WARN_1M=$value ;;
+        LOAD_CRITICAL_1M) LOAD_CRITICAL_1M=$value ;;
+        BACKUP_MAX_AGE_HOURS) BACKUP_MAX_AGE_HOURS=$value ;;
+        NFS_ENABLED) NFS_ENABLED=$value ;;
+        *) printf 'Unknown config key: %s\n' "$key" >&2; exit 2 ;;
+    esac
+done <"$CONFIG_FILE"
+
+for value in "$DISK_WARN_PERCENT" "$DISK_CRITICAL_PERCENT" "$MEMORY_WARN_AVAILABLE_PERCENT" "$MEMORY_CRITICAL_AVAILABLE_PERCENT"; do
+    if [[ ! $value =~ ^([0-9]|[1-9][0-9]|100)$ ]]; then printf 'Percentage threshold out of range: %s\n' "$value" >&2; exit 2; fi
+done
+if ((DISK_WARN_PERCENT >= DISK_CRITICAL_PERCENT || MEMORY_CRITICAL_AVAILABLE_PERCENT >= MEMORY_WARN_AVAILABLE_PERCENT)); then
+    printf 'Disk warn must be below critical; memory critical must be below warn.\n' >&2
+    exit 2
+fi
+if ((DISK_WARN_PERCENT < 1)); then
+    printf 'DISK_WARN_PERCENT must be at least 1.\n' >&2
+    exit 2
+fi
+if [[ ! $BACKUP_MAX_AGE_HOURS =~ ^[1-9][0-9]{0,3}$ ]] || ((10#$BACKUP_MAX_AGE_HOURS > 8760)); then
+    printf 'BACKUP_MAX_AGE_HOURS must be 1 through 8760.\n' >&2
+    exit 2
+fi
+if [[ $NFS_ENABLED != true && $NFS_ENABLED != false ]]; then printf 'NFS_ENABLED must be true or false.\n' >&2; exit 2; fi
+for value in "$LOAD_WARN_1M" "$LOAD_CRITICAL_1M"; do
+    if [[ ! $value =~ ^[0-9]+([.][0-9]+)?$ ]]; then printf 'Invalid load threshold: %s\n' "$value" >&2; exit 2; fi
+done
+if ! awk -v warn="$LOAD_WARN_1M" -v critical="$LOAD_CRITICAL_1M" 'BEGIN { exit !(warn < critical) }'; then
+    printf 'LOAD_WARN_1M must be below LOAD_CRITICAL_1M.\n' >&2
+    exit 2
+fi
+
+classify_disk_usage() {
+    local usage=$1
+    if ((usage >= DISK_CRITICAL_PERCENT)); then
+        printf 'CRITICAL'
+    elif ((usage >= DISK_WARN_PERCENT)); then
+        printf 'WARN'
+    else
+        printf 'OK'
+    fi
+}
+
+if [[ $self_test_thresholds == true ]]; then
+    for boundary in "$((DISK_WARN_PERCENT - 1)):OK" "$DISK_WARN_PERCENT:WARN" \
+        "$((DISK_CRITICAL_PERCENT - 1)):WARN" "$DISK_CRITICAL_PERCENT:CRITICAL"; do
+        usage=${boundary%%:*}
+        expected=${boundary#*:}
+        actual=$(classify_disk_usage "$usage")
+        if [[ $actual != "$expected" ]]; then
+            printf 'FAIL | disk threshold %s%% expected=%s actual=%s\n' "$usage" "$expected" "$actual" >&2
+            exit 1
+        fi
+        printf 'PASS | disk threshold %s%% status=%s\n' "$usage" "$actual"
+    done
+    exit 0
+fi
+
+if ((EUID != 0)); then printf 'Run as root to write the canonical report and log.\n' >&2; exit 1; fi
+for command_name in date df systemctl getenforce firewall-cmd stat find install mktemp mv mountpoint sort head tr chown chmod; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$command_name" >&2
+        exit 3
+    fi
+done
+
+record() {
+    local status=$1 name=$2 detail=$3
+    RESULTS+=("$status | $name | $detail")
+    case $status in
+        CRITICAL) critical_count=$((critical_count + 1)) ;;
+        WARN) warning_count=$((warning_count + 1)) ;;
+    esac
+}
+
+check_disk() {
+    local path=$1 usage
+    if [[ $path == /srv/company ]] && ! mountpoint -q "$path"; then
+        record CRITICAL "Filesystem $path" 'not mounted'
+        return
+    fi
+    if ! usage=$(df -P --output=pcent "$path" | awk 'NR == 2 { gsub(/%/, ""); print $1 }'); then
+        record CRITICAL "Filesystem $path" 'df command failed'
+        return
+    fi
+    if [[ ! $usage =~ ^[0-9]+$ ]]; then record CRITICAL "Filesystem $path" "could not parse usage: $usage"; return; fi
+    status=$(classify_disk_usage "$usage")
+    record "$status" "Filesystem $path" "observed=${usage}% warn_threshold=${DISK_WARN_PERCENT}% critical_threshold=${DISK_CRITICAL_PERCENT}%"
+}
+
+check_service() {
+    local service=$1
+    if systemctl is-active --quiet "$service"; then
+        record OK "Service $service" 'active'
+    else
+        state=$(systemctl is-active "$service" 2>/dev/null || true)
+        record CRITICAL "Service $service" "state=${state:-unknown}"
+    fi
+}
+
+timestamp=$(date --iso-8601=seconds)
+check_disk /
+check_disk /srv/company
+
+mem_values=$(awk '/^MemTotal:/ { total=$2 } /^MemAvailable:/ { available=$2 } END { if (total > 0) print total, available }' /proc/meminfo)
+if [[ $mem_values =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+    mem_total_kb=${BASH_REMATCH[1]}
+    mem_available_kb=${BASH_REMATCH[2]}
+    mem_percent=$((mem_available_kb * 100 / mem_total_kb))
+    if ((mem_percent <= MEMORY_CRITICAL_AVAILABLE_PERCENT)); then
+        record CRITICAL Memory "available=${mem_available_kb}KiB/${mem_total_kb}KiB (${mem_percent}%) critical_threshold=${MEMORY_CRITICAL_AVAILABLE_PERCENT}%"
+    elif ((mem_percent <= MEMORY_WARN_AVAILABLE_PERCENT)); then
+        record WARN Memory "available=${mem_available_kb}KiB/${mem_total_kb}KiB (${mem_percent}%) warn_threshold=${MEMORY_WARN_AVAILABLE_PERCENT}%"
+    else
+        record OK Memory "available=${mem_available_kb}KiB/${mem_total_kb}KiB (${mem_percent}%) warn_threshold=${MEMORY_WARN_AVAILABLE_PERCENT}%"
+    fi
+else
+    record CRITICAL Memory 'unable to read MemTotal/MemAvailable from /proc/meminfo'
+fi
+
+load_1m=$(awk '{ print $1 }' /proc/loadavg)
+if [[ ! $load_1m =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    record CRITICAL 'System load' "unable to parse 1-minute load: $load_1m"
+elif awk -v value="$load_1m" -v threshold="$LOAD_CRITICAL_1M" 'BEGIN { exit !(value >= threshold) }'; then
+    record CRITICAL 'System load' "1m=${load_1m} critical_threshold=${LOAD_CRITICAL_1M}"
+elif awk -v value="$load_1m" -v threshold="$LOAD_WARN_1M" 'BEGIN { exit !(value >= threshold) }'; then
+    record WARN 'System load' "1m=${load_1m} warn_threshold=${LOAD_WARN_1M} critical_threshold=${LOAD_CRITICAL_1M}"
+else
+    record OK 'System load' "1m=${load_1m} warn_threshold=${LOAD_WARN_1M}"
+fi
+
+check_service sshd
+check_service httpd
+if [[ $NFS_ENABLED == true ]]; then
+    check_service nfs-server
+elif systemctl is-active --quiet nfs-server; then
+    record WARN 'Service nfs-server' 'active while NFS_ENABLED=false'
+else
+    record SKIP 'Service nfs-server' 'NFS_ENABLED=false'
+fi
+
+failed_units=$(systemctl --failed --no-legend --plain | awk 'NF { count++ } END { print count+0 }')
+if [[ ! $failed_units =~ ^[0-9]+$ ]]; then
+    record CRITICAL 'Failed systemd units' "unable to parse result: $failed_units"
+elif ((failed_units > 0)); then
+    record WARN 'Failed systemd units' "count=${failed_units}"
+else
+    record OK 'Failed systemd units' 'count=0'
+fi
+
+selinux_mode=$(getenforce)
+if [[ $selinux_mode == Enforcing ]]; then record OK SELinux "mode=${selinux_mode}"; else record CRITICAL SELinux "mode=${selinux_mode} expected=Enforcing"; fi
+
+firewall_state=$(firewall-cmd --state 2>&1) || firewall_state=inactive
+if [[ $firewall_state == running ]]; then
+    active_zones=$(firewall-cmd --get-active-zones | tr '\n' ';')
+    record OK firewalld "state=running active_zones=${active_zones}"
+else
+    record CRITICAL firewalld "state=${firewall_state}"
+fi
+
+if [[ -x /usr/local/sbin/elsm-backup ]]; then
+    if [[ -d /var/backups/elsm && ! -L /var/backups/elsm ]]; then
+        newest_backup=$(find /var/backups/elsm -maxdepth 1 -type f -name 'elsm-*.tar.gz' -printf '%T@ %p\n' | sort -nr | head -n 1 || true)
+        if [[ -z $newest_backup ]]; then
+            record CRITICAL 'Backup freshness' 'backup script installed but no archive exists'
+        else
+            backup_epoch=${newest_backup%% *}
+            backup_path=${newest_backup#* }
+            backup_age_seconds=$(( $(date +%s) - ${backup_epoch%.*} ))
+            backup_age_hours=$((backup_age_seconds / 3600))
+            if ((backup_age_hours > BACKUP_MAX_AGE_HOURS)); then
+                record CRITICAL 'Backup freshness' "path=${backup_path} age_hours=${backup_age_hours} max_age_hours=${BACKUP_MAX_AGE_HOURS}"
+            else
+                record OK 'Backup freshness' "path=${backup_path} age_hours=${backup_age_hours} max_age_hours=${BACKUP_MAX_AGE_HOURS}"
+            fi
+        fi
+    else
+        record CRITICAL 'Backup freshness' 'backup script installed but canonical destination is absent or symlinked'
+    fi
+else
+    record SKIP 'Backup freshness' 'Part 07 backup script is not installed'
+fi
+
+if ((critical_count > 0)); then overall=CRITICAL; elif ((warning_count > 0)); then overall=WARN; fi
+if [[ -L /var/lib/elsm || -L /var/lib/elsm/health || -L $REPORT_FILE || -L /var/log/elsm || -L $LOG_FILE ]]; then
+    printf 'Refusing to write through a symbolic link in report/log paths.\n' >&2
+    exit 1
+fi
+if [[ -e $REPORT_FILE && ! -f $REPORT_FILE ]] || [[ -e $LOG_FILE && ! -f $LOG_FILE ]]; then
+    printf 'Report or log path exists but is not a regular file.\n' >&2
+    exit 1
+fi
+install -d -o root -g root -m 0700 "$(dirname "$REPORT_FILE")"
+install -d -o root -g root -m 0750 "$(dirname "$LOG_FILE")"
+if [[ ! -e $LOG_FILE ]]; then install -o root -g root -m 0640 /dev/null "$LOG_FILE"; fi
+chown root:root "$LOG_FILE"
+chmod 0640 "$LOG_FILE"
+report_tmp=$(mktemp "$(dirname "$REPORT_FILE")/.latest.XXXXXX")
+trap 'rm -f -- "$report_tmp"' EXIT
+{
+    printf 'ELSM health report\nGenerated: %s\nOverall: %s\n\n' "$timestamp" "$overall"
+    printf 'Thresholds: disk_warn=%s%% disk_critical=%s%% memory_warn_available=%s%% memory_critical_available=%s%% load_warn_1m=%s load_critical_1m=%s backup_max_age_hours=%s\n\n' \
+        "$DISK_WARN_PERCENT" "$DISK_CRITICAL_PERCENT" "$MEMORY_WARN_AVAILABLE_PERCENT" \
+        "$MEMORY_CRITICAL_AVAILABLE_PERCENT" "$LOAD_WARN_1M" "$LOAD_CRITICAL_1M" "$BACKUP_MAX_AGE_HOURS"
+    printf '%s\n' "${RESULTS[@]}"
+} >"$report_tmp"
+chmod 0600 "$report_tmp"
+mv -f -- "$report_tmp" "$REPORT_FILE"
+printf '%s [%s] overall=%s critical=%s warnings=%s report=%s\n' "$timestamp" INFO "$overall" "$critical_count" "$warning_count" "$REPORT_FILE" >>"$LOG_FILE"
+cat "$REPORT_FILE"
+if ((critical_count > 0)); then exit 1; fi
+exit 0

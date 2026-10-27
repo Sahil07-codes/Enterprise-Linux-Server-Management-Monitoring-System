@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily ELSM company-data backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=elsm-backup.service
+
+[Install]
+WantedBy=timers.target
+

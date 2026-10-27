@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    printf 'Usage: validate-storage [--help]\nRead-only checks for vg_elsm/lv_company and /srv/company.\n'
+}
+
+if (($# > 0)); then
+    if (($# == 1)) && [[ $1 == --help ]]; then usage; exit 0; fi
+    usage >&2
+    exit 2
+fi
+
+missing=0
+for command_name in date lsblk pvs vgs lvs blkid findmnt df; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Missing required command: %s\n' "$command_name" >&2
+        missing=1
+    fi
+done
+if ((missing)); then exit 3; fi
+
+printf 'ELSM storage validation: %s\n' "$(date --iso-8601=seconds)"
+printf '%s\n' '== Block devices =='
+lsblk -f
+printf '%s\n' '== Physical volumes =='
+pvs
+printf '%s\n' '== Volume groups =='
+vgs
+printf '%s\n' '== Logical volumes =='
+lvs
+if ! vgs vg_elsm >/dev/null 2>&1 || ! lvs /dev/vg_elsm/lv_company >/dev/null 2>&1; then
+    printf 'Expected vg_elsm/lv_company was not found.\n' >&2
+    exit 1
+fi
+printf '%s\n' '== Company mount =='
+if ! findmnt --mountpoint /srv/company; then
+    printf '/srv/company is not mounted.\n' >&2
+    exit 1
+fi
+mount_info=$(findmnt --noheadings --raw --output SOURCE,FSTYPE --mountpoint /srv/company)
+read -r mount_source mount_type <<<"$mount_info"
+if [[ $mount_type != xfs ]]; then
+    printf 'Expected XFS at /srv/company; observed %s.\n' "${mount_type:-unknown}" >&2
+    exit 1
+fi
+case $mount_source in
+    /dev/mapper/vg_elsm-lv_company|/dev/vg_elsm/lv_company) ;;
+    *)
+        printf 'Expected vg_elsm/lv_company at /srv/company; observed source %s.\n' "${mount_source:-unknown}" >&2
+        exit 1
+        ;;
+esac
+printf 'Source: %s; filesystem: %s\n' "$mount_source" "$mount_type"
+df -hT /srv/company
+printf '%s\n' '== Persistent mount validation =='
+findmnt --verify

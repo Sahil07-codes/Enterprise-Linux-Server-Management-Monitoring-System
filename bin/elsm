@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""Safe test, preflight, validation, and deployment-planning CLI for ELSM."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = ROOT / "config" / "automation.json"
+VALID_STATUSES = {"PASS", "FAIL", "BLOCKED", "NOT RUN", "REVIEW REQUIRED"}
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+EXIT_BLOCKED = 3
+
+
+def timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def safe_relative_file(root: Path, value: str, label: str) -> Path:
+    candidate = (root / value).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label} must resolve inside the repository: {value}") from exc
+    return candidate
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read valid automation configuration at {path}: {exc}") from exc
+    if not isinstance(config, dict) or config.get("schema_version") != 1:
+        raise ValueError("Unsupported or malformed automation configuration (expected schema_version 1).")
+    for section in ("paths", "repository_files"):
+        if not isinstance(config.get(section), dict):
+            raise ValueError(f"Configuration section '{section}' must be an object.")
+    for key in ("reports", "automation_log"):
+        value = config["paths"].get(key)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError(f"paths.{key} must be an absolute path.")
+    if not isinstance(config.get("deployment_steps"), list):
+        raise ValueError("Configuration section 'deployment_steps' must be an array.")
+    for index, step in enumerate(config["deployment_steps"]):
+        if not isinstance(step, dict) or not all(
+            isinstance(step.get(key), str) and step[key]
+            for key in ("name", "owner", "mode", "prerequisite", "verification")
+        ):
+            raise ValueError(f"Invalid deployment step at index {index}.")
+    for key, value in config["repository_files"].items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"repository_files.{key} must be a non-empty relative path.")
+        safe_relative_file(ROOT, value, f"repository_files.{key}")
+    return config
+
+
+def check_record(
+    name: str,
+    status: str,
+    detail: str,
+    *,
+    command: list[str] | None = None,
+    returncode: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    started_at: str | None = None,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Invalid check status: {status}")
+    return {
+        "name": name,
+        "status": status,
+        "detail": detail,
+        "command": command or [],
+        "returncode": returncode,
+        "started_at": started_at or timestamp(),
+        "duration_ms": duration_ms,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def run_command(
+    name: str,
+    command: list[str],
+    cwd: Path = ROOT,
+    review_exit_codes: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    started = timestamp()
+    monotonic_start = time.monotonic()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        elapsed = round((time.monotonic() - monotonic_start) * 1000)
+        return check_record(
+            name,
+            "BLOCKED",
+            f"Could not start command: {exc}",
+            command=command,
+            returncode=None,
+            stderr=str(exc),
+            started_at=started,
+            duration_ms=elapsed,
+        )
+    elapsed = round((time.monotonic() - monotonic_start) * 1000)
+    if completed.returncode == 0:
+        status, detail = "PASS", "Command completed successfully."
+    elif completed.returncode == 77:
+        status, detail = "BLOCKED", "Test reported a missing prerequisite (exit 77)."
+    elif completed.returncode in review_exit_codes:
+        status, detail = "REVIEW REQUIRED", "Command completed with a review-required result (exit 2)."
+    else:
+        status, detail = "FAIL", f"Command failed with exit code {completed.returncode}."
+    return check_record(
+        name,
+        status,
+        detail,
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        started_at=started,
+        duration_ms=elapsed,
+    )
+
+
+def result_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    return {status: sum(1 for item in results if item["status"] == status) for status in sorted(VALID_STATUSES)}
+
+
+def exit_for_results(results: list[dict[str, Any]]) -> int:
+    statuses = {result["status"] for result in results}
+    if "FAIL" in statuses:
+        return EXIT_FAILURE
+    if "BLOCKED" in statuses or "REVIEW REQUIRED" in statuses:
+        return EXIT_BLOCKED
+    return 0
+
+
+def recommended_actions(results: list[dict[str, Any]]) -> list[str]:
+    statuses = {result["status"] for result in results}
+    actions: list[str] = []
+    if "FAIL" in statuses:
+        actions.append("Review failed command output and the owning component runbook before retrying.")
+    if "BLOCKED" in statuses:
+        actions.append("Resolve the reported prerequisite or run the check on its required RHEL lab target.")
+    if "REVIEW REQUIRED" in statuses:
+        actions.append("Complete the corresponding operator/network acceptance review and record evidence.")
+    if "NOT RUN" in statuses:
+        actions.append("Complete target-only acceptance items when the RHEL VM and optional client are available.")
+    if not actions:
+        actions.append("No additional action is required for the checks recorded in this report.")
+    return actions
+
+
+def environment_info() -> dict[str, str]:
+    try:
+        hostname = platform.node()
+    except OSError:
+        hostname = "unavailable"
+    try:
+        release = platform.freedesktop_os_release().get("PRETTY_NAME", platform.system())
+    except (AttributeError, OSError):
+        release = platform.system()
+    return {
+        "os": release,
+        "kernel": platform.release(),
+        "hostname": hostname,
+        "python": platform.python_version(),
+    }
+
+
+def is_rhel9() -> tuple[bool, str]:
+    release_file = Path("/etc/redhat-release")
+    if not release_file.is_file():
+        return False, "RHEL release file is absent."
+    try:
+        release = release_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as exc:
+        return False, f"Could not read the RHEL release file: {exc}"
+    if "Red Hat Enterprise Linux" in release and "release 9" in release:
+        return True, release
+    return False, f"Observed {release!r}; the documented target is RHEL 9."
+
+
+def run_preflight(config: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    python_ok = sys.version_info >= (3, 9)
+    results.append(
+        check_record(
+            "Python runtime",
+            "PASS" if python_ok else "FAIL",
+            f"Observed Python {platform.python_version()}; Python 3.9 or newer is required.",
+        )
+    )
+    bash_path = shutil.which("bash")
+    results.append(
+        check_record(
+            "Bash runtime",
+            "PASS" if bash_path else "BLOCKED",
+            bash_path or "Bash is required to run component checks.",
+        )
+    )
+    target_ok, detail = is_rhel9()
+    status = "PASS" if target_ok else "BLOCKED"
+    results.append(check_record("RHEL target", status, detail))
+    host_preflight = safe_relative_file(
+        ROOT, config["repository_files"]["host_preflight"], "repository_files.host_preflight"
+    )
+    if target_ok:
+        results.append(run_command("Detailed host inventory", ["bash", str(host_preflight)]))
+    else:
+        results.append(
+            check_record(
+                "Detailed host inventory",
+                "BLOCKED",
+                "Part 01 inventory is target-specific and was not run outside RHEL 9.",
+            )
+        )
+    for key, relative in config["repository_files"].items():
+        try:
+            path = safe_relative_file(ROOT, relative, key)
+        except ValueError as exc:
+            results.append(check_record(f"Repository file {key}", "FAIL", str(exc)))
+            continue
+        exists = path.exists()
+        results.append(
+            check_record(
+                f"Repository file {key}",
+                "PASS" if exists else "FAIL",
+                str(path.relative_to(ROOT)) if exists else f"Required repository file is missing: {relative}",
+            )
+        )
+    return results
+
+
+def record_optional_tools(static_result: dict[str, Any]) -> list[dict[str, Any]]:
+    static_succeeded = static_result["status"] == "PASS"
+    results: list[dict[str, Any]] = []
+    shellcheck_path = shutil.which("shellcheck")
+    shellcheck_status = (
+        "NOT RUN" if not shellcheck_path else "PASS" if static_succeeded else "REVIEW REQUIRED"
+    )
+    results.append(
+        check_record(
+            "Optional ShellCheck lint",
+            shellcheck_status,
+            "ShellCheck is unavailable; static syntax checks still run."
+            if not shellcheck_path
+            else (
+                f"ShellCheck is available at {shellcheck_path}; static check passed."
+                if static_succeeded
+                else f"ShellCheck is available at {shellcheck_path}, but the combined static check did not pass."
+            ),
+        )
+    )
+    ansible_path = shutil.which("ansible-playbook")
+    ansible_status = "NOT RUN" if not ansible_path else "PASS" if static_succeeded else "REVIEW REQUIRED"
+    results.append(
+        check_record(
+            "Optional Ansible syntax check",
+            ansible_status,
+            "ansible-playbook is unavailable."
+            if not ansible_path
+            else (
+                f"Ansible syntax check is included in the passed static check at {ansible_path}."
+                if static_succeeded
+                else f"Ansible is available at {ansible_path}, but the combined static check did not pass."
+            ),
+        )
+    )
+    return results
+
+
+def discovered_unit_tests(config: dict[str, Any]) -> list[Path]:
+    directory = safe_relative_file(
+        ROOT, config["repository_files"]["unit_directory"], "repository_files.unit_directory"
+    )
+    if not directory.is_dir():
+        return []
+    files = [
+        path
+        for path in directory.iterdir()
+        if path.is_file()
+        and (
+            (path.name.startswith("test-") and path.suffix == ".sh")
+            or (path.name.startswith("test_") and path.suffix == ".py")
+        )
+    ]
+    return sorted(files, key=lambda path: path.name)
+
+
+def run_test_suite(config: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    static_path = safe_relative_file(
+        ROOT, config["repository_files"]["static_check"], "repository_files.static_check"
+    )
+    if static_path.is_file():
+        results.append(run_command("Static checks (Bash, ShellCheck, Ansible)", ["bash", str(static_path)]))
+    else:
+        results.append(check_record("Static checks", "FAIL", f"Static check script missing: {static_path}"))
+    tests = discovered_unit_tests(config)
+    if not tests:
+        results.append(check_record("Unit test discovery", "FAIL", "No unit tests were discovered."))
+    for path in tests:
+        command = ["bash", str(path)] if path.suffix == ".sh" else [sys.executable, str(path)]
+        results.append(run_command(f"Unit test: {path.name}", command))
+    results.extend(record_optional_tools(results[0]))
+    for acceptance in config.get("target_acceptance_not_run", []):
+        results.append(check_record(acceptance, "NOT RUN", "Requires the target RHEL lab; not run by the local safe suite."))
+    return results
+
+
+def run_validation(config: dict[str, Any], status_only: bool = False) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    target_ok, target_detail = is_rhel9()
+    checks = [
+        ("status_check", "Read-only component status"),
+        ("smoke_check", "Read-only integration smoke check"),
+    ]
+    if status_only:
+        checks = checks[:1]
+    for key, title in checks:
+        if not target_ok:
+            results.append(
+                check_record(
+                    title,
+                    "BLOCKED",
+                    f"Target-only integration validation was not run: {target_detail}",
+                )
+            )
+            continue
+        path = safe_relative_file(ROOT, config["repository_files"][key], key)
+        if not path.is_file():
+            results.append(check_record(title, "FAIL", f"Validation script is missing: {path}"))
+        else:
+            results.append(
+                run_command(
+                    title,
+                    ["bash", str(path)],
+                    review_exit_codes=(2,) if key == "status_check" else (),
+                )
+            )
+    return results
+
+
+def deployment_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        check_record(
+            f"Plan: {step['name']}",
+            "REVIEW REQUIRED",
+            f"{step['owner']} | {step['mode']} | prerequisite: {step['prerequisite']} | "
+            f"verify: {step['verification']}",
+        )
+        for step in config["deployment_steps"]
+    ]
+
+
+def report_payload(command: str, profile: str | None, results: list[dict[str, Any]]) -> dict[str, Any]:
+    configuration_warnings = [
+        item["detail"]
+        for item in results
+        if item["status"] == "NOT RUN" and item["name"].startswith("Optional ")
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at": timestamp(),
+        "command": command,
+        "profile": profile,
+        "environment": environment_info(),
+        "summary": {
+            "exit_code": exit_for_results(results),
+            "counts": result_counts(results),
+            "total": len(results),
+            "duration_ms": sum(item["duration_ms"] or 0 for item in results),
+        },
+        "configuration_warnings": configuration_warnings,
+        "host_changes": [],
+        "recommended_next_actions": recommended_actions(results),
+        "results": results,
+    }
+
+
+def render_text(report: dict[str, Any]) -> str:
+    summary = report["summary"]
+    lines = [
+        "ELSM automation report",
+        f"Generated: {report['generated_at']}",
+        f"Command: {report['command']}",
+        f"Profile: {report.get('profile') or 'not specified'}",
+        f"OS: {report['environment']['os']}",
+        f"Kernel: {report['environment']['kernel']}",
+        f"Hostname: {report['environment']['hostname']}",
+        f"Summary: exit={summary['exit_code']} total={summary['total']} duration_ms={summary['duration_ms']}",
+    ]
+    lines.extend(f"  {status}: {count}" for status, count in summary["counts"].items())
+    lines.append(f"Host configuration changes: {len(report['host_changes'])}")
+    lines.append("Configuration warnings:")
+    lines.extend(f"  - {warning}" for warning in report["configuration_warnings"])
+    lines.append("Recommended next actions:")
+    lines.extend(f"  - {action}" for action in report["recommended_next_actions"])
+    lines.append("")
+    for result in report["results"]:
+        lines.append(f"[{result['status']}] {result['name']}: {result['detail']}")
+        if result["command"]:
+            lines.append(f"  Command: {shlex.join(result['command'])}")
+        if result["returncode"] is not None:
+            lines.append(f"  Exit code: {result['returncode']}; duration_ms={result['duration_ms']}")
+        if result["stdout"].strip():
+            lines.extend(f"  stdout: {line}" for line in result["stdout"].rstrip().splitlines())
+        if result["stderr"].strip():
+            lines.extend(f"  stderr: {line}" for line in result["stderr"].rstrip().splitlines())
+    return "\n".join(lines) + "\n"
+
+
+def write_private(path: Path, content: str) -> None:
+    for parent in path.parents:
+        if parent.exists() and parent.is_symlink():
+            raise OSError(f"Refusing to write through a symbolic-link directory: {parent}")
+    if path.exists() and not path.is_file():
+        raise OSError(f"Refusing to replace a non-regular report file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+    if path.parent.is_symlink() or path.is_symlink():
+        raise OSError(f"Refusing to write through a symbolic link: {path}")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def validate_output_paths(report_dir: Path, log_file: Path, home: Path | None = None) -> None:
+    allowed_roots = [Path("/tmp").resolve(), Path("/var/tmp").resolve()]
+    home_path = (home or Path.home()).resolve()
+    allowed_roots.append(home_path)
+    default_report_dir = Path("/var/lib/elsm/reports").resolve()
+    default_log_file = Path("/var/log/elsm/automation.log").resolve()
+
+    def is_within(path: Path, base: Path) -> bool:
+        try:
+            path.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    for candidate in (report_dir, log_file):
+        if not candidate.is_absolute():
+            raise ValueError(f"Output paths must be absolute: {candidate}")
+        for parent in candidate.parents:
+            if parent.exists() and parent.is_symlink():
+                raise ValueError(f"Refusing an output path with a symbolic-link parent: {parent}")
+    report_path = report_dir.resolve()
+    repository_path = ROOT.resolve()
+    if is_within(report_path, repository_path) or is_within(log_file.resolve().parent, repository_path):
+        raise ValueError("Automation report and log outputs must not be written inside the repository.")
+    if report_path != default_report_dir and not any(
+        is_within(report_path, base) for base in allowed_roots
+    ):
+        raise ValueError(
+            "Custom report directories must be under /tmp, /var/tmp, or the user's home directory."
+        )
+    log_path = log_file.resolve()
+    if log_path != default_log_file:
+        if log_path.name != "automation.log" or not any(
+            is_within(log_path.parent, base) for base in allowed_roots
+        ):
+            raise ValueError(
+                "Custom log files must be named automation.log under /tmp, /var/tmp, or the user's home directory."
+            )
+
+
+def persist_report(report: dict[str, Any], report_dir: Path, log_file: Path) -> tuple[Path, Path]:
+    text_path = report_dir / "latest.txt"
+    json_path = report_dir / "latest.json"
+    write_private(text_path, render_text(report))
+    write_private(json_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
+    log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+    if log_file.parent.is_symlink() or log_file.is_symlink():
+        raise OSError(f"Refusing to append through a symbolic link: {log_file}")
+    if log_file.exists():
+        if not log_file.is_file():
+            raise OSError(f"Refusing to append to a non-regular log file: {log_file}")
+        with log_file.open("r", encoding="utf-8", errors="replace") as stream:
+            first_line = stream.readline()
+        if first_line and not first_line.startswith("ELSM-AUTOMATION "):
+            raise OSError(f"Refusing to append to a log without the ELSM marker: {log_file}")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(log_file, flags, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+        if hasattr(os, "fchmod"):
+            os.fchmod(stream.fileno(), 0o600)
+        stream.write(
+            f"ELSM-AUTOMATION {report['generated_at']} command={report['command']} "
+            f"exit={report['summary']['exit_code']} total={report['summary']['total']}\n"
+        )
+    return text_path, json_path
+
+
+def add_common_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Automation JSON configuration.")
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help="Report output directory (default: /var/lib/elsm/reports).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Append-only automation summary log.",
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="elsm", description="Safe ELSM tests, verification, and deployment planning.")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    for name in ("preflight", "test", "validate", "plan", "deploy", "status", "report"):
+        subparser = subparsers.add_parser(name)
+        add_common_options(subparser)
+        if name == "deploy":
+            subparser.add_argument("--profile", choices=("lab",), default="lab")
+    all_parser = subparsers.add_parser("all", help="Run safe checks for test or lab profile.")
+    add_common_options(all_parser)
+    all_parser.add_argument("--profile", choices=("test", "lab"), default="test")
+    return parser.parse_args(argv)
+
+
+def load_previous_report(report_dir: Path) -> dict[str, Any] | None:
+    path = report_dir / "latest.json"
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(report, dict)
+        or report.get("schema_version") != 1
+        or not isinstance(report.get("results"), list)
+        or not all(
+            isinstance(item, dict) and item.get("status") in VALID_STATUSES
+            for item in report["results"]
+        )
+        or not isinstance(report.get("summary"), dict)
+        or not isinstance(report.get("environment"), dict)
+    ):
+        return None
+    report.setdefault("configuration_warnings", [])
+    report.setdefault("host_changes", [])
+    report.setdefault("recommended_next_actions", recommended_actions(report["results"]))
+    if isinstance(report.get("summary"), dict):
+        report["summary"].setdefault(
+            "duration_ms", sum(item.get("duration_ms") or 0 for item in report["results"])
+        )
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parse_args(argv)
+        config = load_config(args.config)
+        args.report_dir = args.report_dir or Path(
+            os.environ.get("ELSM_REPORT_DIR", config["paths"]["reports"])
+        )
+        args.log_file = args.log_file or Path(
+            os.environ.get("ELSM_LOG_FILE", config["paths"]["automation_log"])
+        )
+        validate_output_paths(args.report_dir, args.log_file)
+    except (SystemExit, ValueError) as exc:
+        if isinstance(exc, SystemExit):
+            return int(exc.code or 0)
+        print(f"elsm: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    subcommand = args.subcommand
+    profile = getattr(args, "profile", None)
+    if subcommand == "report":
+        previous = load_previous_report(args.report_dir)
+        if previous is None:
+            results = [
+                check_record(
+                    "Previous automation run",
+                    "NOT RUN",
+                    "No prior report exists; run 'elsm test' or 'elsm validate' first.",
+                )
+            ]
+            report = report_payload("report", None, results)
+        else:
+            report = previous
+            report["generated_at"] = timestamp()
+            report["command"] = "report"
+    else:
+        if subcommand == "preflight":
+            results = run_preflight(config)
+        elif subcommand == "test":
+            results = run_test_suite(config)
+        elif subcommand == "status":
+            results = run_validation(config, status_only=True)
+        elif subcommand == "validate":
+            results = run_validation(config)
+        elif subcommand == "plan":
+            results = deployment_plan(config)
+        elif subcommand == "deploy":
+            results = deployment_plan(config)
+            results.append(
+                check_record(
+                    "Deployment execution",
+                    "BLOCKED",
+                    "No component-wide apply interface exists. This command is plan-only; follow the reviewed manual runbooks.",
+                )
+            )
+        elif subcommand == "all" and profile == "test":
+            results = run_test_suite(config)
+        elif subcommand == "all" and profile == "lab":
+            results = run_preflight(config)
+            results.extend(run_test_suite(config))
+            results.extend(run_validation(config))
+            results.extend(deployment_plan(config))
+            results.append(
+                check_record(
+                    "Lab deployment",
+                    "BLOCKED",
+                    "No end-to-end deployment apply workflow is implemented; no system changes were attempted.",
+                )
+            )
+        else:
+            print(f"elsm: unsupported command/profile combination: {subcommand}", file=sys.stderr)
+            return EXIT_USAGE
+        report = report_payload(subcommand, profile, results)
+        if subcommand == "plan":
+            report["summary"]["exit_code"] = 0
+
+    try:
+        text_path, json_path = persist_report(report, args.report_dir, args.log_file)
+    except OSError as exc:
+        print(f"elsm: unable to persist reports securely: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    print(render_text(report), end="")
+    print(f"Text report: {text_path}")
+    print(f"JSON report: {json_path}")
+    return int(report["summary"]["exit_code"])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

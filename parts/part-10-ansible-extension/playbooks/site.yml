@@ -1,0 +1,43 @@
+---
+- name: Manage low-risk ELSM identity baseline
+  hosts: elsm_servers
+  become: true
+  gather_facts: false
+
+  vars:
+    elsm_groups:
+      - linuxadmins
+      - developers
+      - hrteam
+      - ops
+      - projectreaders
+    elsm_users:
+      - { name: dev01, group: developers, supplementary: [projectreaders] }
+      - { name: dev02, group: developers, supplementary: [projectreaders] }
+      - { name: hr01, group: hrteam, supplementary: [] }
+      - { name: ops01, group: ops, supplementary: [projectreaders] }
+      - { name: auditor01, group: projectreaders, supplementary: [] }
+
+  tasks:
+    - name: Ensure canonical groups exist
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ elsm_groups }}"
+
+    - name: Read existing local accounts without changing them
+      ansible.builtin.getent:
+        database: passwd
+
+    - name: Ensure lab accounts exist without usable passwords
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        group: "{{ item.group }}"
+        groups: "{{ item.supplementary | join(',') if item.supplementary | length > 0 else omit }}"
+        append: true
+        create_home: true
+        shell: /bin/bash
+        password_lock: true
+        state: present
+      loop: "{{ elsm_users }}"
+      when: item.name not in ansible_facts.getent_passwd
